@@ -312,7 +312,6 @@ function prepareMaterials(object) {
       const mode = m.map && alphaModes[m.map.userData.stem];
       if (mode === 'cutout') {
         m.alphaTest = 0.5;
-        m.alphaToCoverage = true; // smooth edges
         m.side = THREE.DoubleSide;
         m.needsUpdate = true;
       } else if (mode === 'blend') {
