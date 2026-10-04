@@ -2,11 +2,10 @@ import './style.css';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
-import { TGALoader } from 'three/addons/loaders/TGALoader.js';
+import { createTextureSupport, missing } from './textures.js';
 
 // Everything in public/assets/ is copied as-is to the built site.
 const ASSETS = `${import.meta.env.BASE_URL}assets/`;
-const IMAGE_EXT = /\.(tga|png|jpe?g|bmp|gif|webp)$/i;
 
 const DEFAULTS = {
   title: '',
@@ -178,48 +177,10 @@ function resetView() {
 
 /* ---------- Loading ---------- */
 
-const missing = new Set();
 let bust = '';
 
 const manager = new THREE.LoadingManager();
-// TGA support. Also records files that fail to download or decode.
-class TrackedTGALoader extends TGALoader {
-  load(url, onLoad, onProgress, onError) {
-    return super.load(url, onLoad, onProgress, (err) => {
-      markMissing(url);
-      if (onError) onError(err);
-      else console.warn(`Couldn't load texture ${url}`, err);
-    });
-  }
-}
-manager.addHandler(/\.tga$/i, new TrackedTGALoader(manager));
-
-// FBX files usually store the texture path from the artist's computer
-// (e.g. C:\Users\me\Desktop\wood.tga). Ignore the folders and look for
-// the file by name in assets/ instead.
-manager.setURLModifier((url) => {
-  if (url.startsWith('blob:') || url.startsWith('data:')) return url;
-  const clean = url.split('?')[0];
-  if (!IMAGE_EXT.test(clean)) return url;
-  let name = clean.split(/[\\/]/).pop();
-  try {
-    name = decodeURIComponent(name);
-  } catch {
-    /* keep as is */
-  }
-  return `${ASSETS}${encodeURIComponent(name)}${bust}`;
-});
-
-function markMissing(url) {
-  let name = url.split('?')[0].split(/[\\/]/).pop();
-  try {
-    name = decodeURIComponent(name);
-  } catch {
-    /* keep as is */
-  }
-  if (IMAGE_EXT.test(name)) missing.add(name);
-}
-manager.onError = markMissing;
+createTextureSupport(manager, { assetsBase: ASSETS, bust: () => bust });
 
 function setProgress(fraction, text) {
   ui.loader.classList.toggle('is-indeterminate', fraction == null);
@@ -269,6 +230,13 @@ function prepareMaterials(object) {
     child.frustumCulled = !child.isSkinnedMesh; // skinned meshes can be culled wrongly while animating
     const materials = Array.isArray(child.material) ? child.material : [child.material];
     for (const m of materials) {
+      // A texture that couldn't be loaded would draw as solid black; show the plain material colour instead.
+      for (const key of ['map', 'normalMap', 'specularMap', 'emissiveMap', 'bumpMap', 'alphaMap', 'aoMap']) {
+        if (m[key]?.userData.failed) {
+          m[key] = null;
+          m.needsUpdate = true;
+        }
+      }
       if (m.map) m.map.anisotropy = maxAniso;
     }
   });
@@ -337,8 +305,8 @@ async function start() {
   showHint();
 
   if (missing.size) {
-    const list = [...missing].join(', ');
-    ui.noticeText.textContent = `Some textures weren't found in assets/: ${list}. Add them with exactly these names (case matters).`;
+    const list = [...missing].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).join(', ');
+    ui.noticeText.textContent = `Missing textures: ${list}. Add files with these names (.tga, .png or .jpg) to public/assets/.`;
     ui.notice.hidden = false;
     ui.hint.hidden = true;
   }
