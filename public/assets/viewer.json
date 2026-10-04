@@ -1,0 +1,9 @@
+{
+  "title": "My model",
+  "description": "",
+  "model": "model.fbx",
+  "version": "1",
+  "autoRotate": true,
+  "playAnimation": true,
+  "background": ""
+}
