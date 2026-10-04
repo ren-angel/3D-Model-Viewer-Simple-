@@ -93,6 +93,7 @@ export function createTextureSupport(manager, { assetsBase, bust }) {
 
       const { stem, found } = resolve(url);
       if (!found) return fail(stem);
+      const key = stem.toLowerCase();
 
       let entry = cache.get(found.url);
       if (!entry) {
@@ -117,10 +118,12 @@ export function createTextureSupport(manager, { assetsBase, bust }) {
             console.warn(`Couldn't load texture ${found.url}`, err);
           },
         );
+        e.master.userData.stem = key;
         return e.master;
       }
 
       const t = entry.master.isDataTexture ? new THREE.DataTexture() : new THREE.Texture();
+      t.userData.stem = key;
       if (entry.failed) t.userData.failed = true;
       else if (entry.done) share(t, entry.master);
       else entry.waiting.push(t);

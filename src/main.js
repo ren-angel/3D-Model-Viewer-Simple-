@@ -15,6 +15,7 @@ const DEFAULTS = {
   autoRotate: true,
   playAnimation: true,
   background: '',
+  alpha: {},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -60,6 +61,7 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.screenSpacePanning = true;
+controls.zoomSpeed = 1.3;
 controls.autoRotateSpeed = 1.2;
 
 // Soft studio lighting: sky/ground fill, a shadow-casting key, and a rim from behind.
@@ -91,12 +93,25 @@ let mixer = null;
 let animPaused = false;
 let dirty = true;
 let home = null;
+let tween = null; // camera fly-to animation
+let bounds = null; // the view's focus point can't leave the model's neighbourhood
 
-controls.addEventListener('change', () => (dirty = true));
+controls.addEventListener('change', () => {
+  dirty = true;
+  if (!bounds) return;
+  // Zooming towards the cursor (or panning) over empty background would otherwise drift away from the model.
+  const clamped = controls.target.clone().clamp(bounds.min, bounds.max);
+  if (!clamped.equals(controls.target)) {
+    clamped.sub(controls.target);
+    controls.target.add(clamped);
+    camera.position.add(clamped);
+  }
+});
 
-renderer.setAnimationLoop(() => {
+renderer.setAnimationLoop((now) => {
   timer.update();
   const dt = timer.getDelta();
+  if (tween) stepTween(now);
   let changed = controls.update(dt);
   if (mixer && !animPaused) {
     mixer.update(dt);
@@ -144,11 +159,13 @@ function frameModel(object) {
     target,
   };
 
-  camera.near = distance / 200;
+  camera.near = radius * 0.004; // close enough to zoom right up to the face
   camera.far = distance * 50;
   camera.updateProjectionMatrix();
-  controls.minDistance = radius * 0.15;
+  controls.minDistance = radius * 0.01;
   controls.maxDistance = distance * 6;
+
+  bounds = box.clone().expandByScalar(radius * 0.15);
 
   ground.scale.setScalar(radius * 10);
 
@@ -167,7 +184,56 @@ function frameModel(object) {
   resetView();
 }
 
+function flyTo(position, target) {
+  if (reducedMotion) {
+    camera.position.copy(position);
+    controls.target.copy(target);
+    controls.update();
+    dirty = true;
+    return;
+  }
+  tween = {
+    fromPos: camera.position.clone(),
+    fromTarget: controls.target.clone(),
+    toPos: position.clone(),
+    toTarget: target.clone(),
+    start: null,
+  };
+}
+
+function stepTween(now) {
+  const t = tween;
+  t.start ??= now;
+  const k = Math.min((now - t.start) / 450, 1);
+  const e = k < 0.5 ? 4 * k * k * k : 1 - (-2 * k + 2) ** 3 / 2; // ease in-out
+  camera.position.lerpVectors(t.fromPos, t.toPos, e);
+  controls.target.lerpVectors(t.fromTarget, t.toTarget, e);
+  controls.update();
+  dirty = true;
+  if (k === 1) tween = null;
+}
+
+let modelRoot = null;
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+/** Fly the camera in to the spot of the model under the screen position. */
+function focusAt(clientX, clientY) {
+  if (!modelRoot) return false;
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObject(modelRoot, true)[0];
+  if (!hit) return false;
+  const point = hit.point;
+  const away = camera.position.clone().sub(point);
+  const distance = Math.max(away.length() * 0.4, controls.minDistance * 4);
+  flyTo(point.clone().add(away.setLength(distance)), point);
+  return true;
+}
+
 function resetView() {
+  tween = null;
   if (!home) return;
   camera.position.copy(home.position);
   controls.target.copy(home.target);
@@ -178,6 +244,7 @@ function resetView() {
 /* ---------- Loading ---------- */
 
 let bust = '';
+let alphaModes = {}; // texture name -> 'cutout' | 'blend' (from viewer.json)
 
 const manager = new THREE.LoadingManager();
 createTextureSupport(manager, { assetsBase: ASSETS, bust: () => bust });
@@ -238,6 +305,21 @@ function prepareMaterials(object) {
         }
       }
       if (m.map) m.map.anisotropy = maxAniso;
+
+      // Transparency stored in a texture's alpha channel (hair strands, eyelashes).
+      // Only applied to the textures named in viewer.json, because in other textures
+      // the alpha channel is a colour mask and cutting it would punch holes.
+      const mode = m.map && alphaModes[m.map.userData.stem];
+      if (mode === 'cutout') {
+        m.alphaTest = 0.5;
+        m.alphaToCoverage = true; // smooth edges
+        m.side = THREE.DoubleSide;
+        m.needsUpdate = true;
+      } else if (mode === 'blend') {
+        m.transparent = true;
+        m.depthWrite = false;
+        m.needsUpdate = true;
+      }
     }
   });
 }
@@ -260,6 +342,9 @@ async function start() {
   if (config.background) {
     document.body.style.background = config.background;
   }
+  alphaModes = Object.fromEntries(
+    Object.entries(config.alpha ?? {}).map(([name, mode]) => [String(name).replace(/\.[^.]+$/, '').toLowerCase(), mode]),
+  );
   bust = config.version ? `?v=${encodeURIComponent(config.version)}` : '';
 
   ui.loader.dataset.phase = 'model';
@@ -289,6 +374,7 @@ async function start() {
 
   prepareMaterials(object);
   scene.add(object);
+  modelRoot = object;
   frameModel(object);
 
   if (object.animations.length && config.playAnimation) {
@@ -317,8 +403,8 @@ async function start() {
 
 function showHint() {
   ui.hint.textContent = coarsePointer
-    ? 'Drag to rotate, pinch to zoom, two fingers to move'
-    : 'Drag to rotate, scroll to zoom, right-drag to move';
+    ? 'Drag to rotate, pinch to zoom, double-tap to focus'
+    : 'Drag to rotate, scroll to zoom, double-click to focus';
   ui.hint.hidden = false;
   const hide = () => ui.hint.classList.add('is-gone');
   controls.addEventListener('start', hide, { once: true });
@@ -352,7 +438,25 @@ if (document.fullscreenEnabled) {
 
 ui.noticeClose.addEventListener('click', () => (ui.notice.hidden = true));
 
-// Double-click / double-tap to go back to the starting view.
-renderer.domElement.addEventListener('dblclick', resetView);
+// Double-click or double-tap: focus on that part of the model, or reset the view if you tap the background.
+// (Detected from pointer events because phones don't reliably send "dblclick".)
+let down = null;
+let lastTap = null;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  down = { x: e.clientX, y: e.clientY, t: e.timeStamp };
+  tween = null; // dragging cancels a fly-to in progress
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!down) return;
+  const isTap = Math.hypot(e.clientX - down.x, e.clientY - down.y) < 8 && e.timeStamp - down.t < 350;
+  down = null;
+  if (!isTap) return;
+  if (lastTap && e.timeStamp - lastTap.t < 400 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 30) {
+    lastTap = null;
+    if (!focusAt(e.clientX, e.clientY)) resetView();
+  } else {
+    lastTap = { x: e.clientX, y: e.clientY, t: e.timeStamp };
+  }
+});
 
 start();

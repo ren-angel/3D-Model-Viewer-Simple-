@@ -5,5 +5,9 @@
   "version": "1",
   "autoRotate": true,
   "playAnimation": true,
-  "background": ""
+  "background": "",
+  "alpha": {
+    "26": "cutout",
+    "14": "blend"
+  }
 }
