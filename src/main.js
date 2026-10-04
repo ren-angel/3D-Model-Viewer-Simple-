@@ -2,25 +2,24 @@ import './style.css';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
-import { createTextureSupport, missing } from './textures.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
+import { assetUrl, createTextureSupport, findAsset, splitName } from './textures.js';
 
 // Everything in public/assets/ is copied as-is to the built site.
 const ASSETS = `${import.meta.env.BASE_URL}assets/`;
 
 const DEFAULTS = {
-  title: '',
-  description: '',
-  model: 'model.fbx',
   version: '',
   autoRotate: true,
   playAnimation: true,
   background: '',
-  alpha: {},
 };
 
 const $ = (id) => document.getElementById(id);
 const ui = {
   stage: $('stage'),
+  tabs: $('tabs'),
   title: $('title'),
   subtitle: $('subtitle'),
   loader: $('loader'),
@@ -95,11 +94,12 @@ let dirty = true;
 let home = null;
 let tween = null; // camera fly-to animation
 let bounds = null; // the view's focus point can't leave the model's neighbourhood
+let modelRoot = null; // the model on screen
 
 controls.addEventListener('change', () => {
   dirty = true;
   if (!bounds) return;
-  // Zooming towards the cursor (or panning) over empty background would otherwise drift away from the model.
+  // Panning over empty background would otherwise drift away from the model.
   const clamped = controls.target.clone().clamp(bounds.min, bounds.max);
   if (!clamped.equals(controls.target)) {
     clamped.sub(controls.target);
@@ -136,18 +136,24 @@ resize();
 
 /* ---------- Framing ---------- */
 
-function frameModel(object) {
-  // Centre the model and stand it on the floor.
+/** Centres the model, stands it on the floor and returns its measurements. Run once per model. */
+function placeModel(object) {
   let box = new THREE.Box3().setFromObject(object);
   const center = box.getCenter(new THREE.Vector3());
   object.position.sub(center);
   object.position.y += center.y - box.min.y;
+  object.updateMatrixWorld(true);
   box = new THREE.Box3().setFromObject(object);
-
   const size = box.getSize(new THREE.Vector3());
-  const radius = Math.max(size.length() / 2, 1e-3);
-  const target = new THREE.Vector3(0, size.y / 2, 0);
+  return {
+    box,
+    radius: Math.max(size.length() / 2, 1e-3),
+    target: new THREE.Vector3(0, size.y / 2, 0),
+  };
+}
 
+/** Sets up camera limits, lights and shadow for a model. */
+function applyFraming({ box, radius, target }) {
   // Fit the bounding sphere in whichever field of view is narrower (portrait phones).
   const vFov = THREE.MathUtils.degToRad(camera.fov);
   const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
@@ -156,10 +162,10 @@ function frameModel(object) {
   const direction = new THREE.Vector3(0.9, 0.45, 1.4).normalize();
   home = {
     position: target.clone().addScaledVector(direction, distance),
-    target,
+    target: target.clone(),
   };
 
-  camera.near = radius * 0.004; // close enough to zoom right up to the face
+  camera.near = radius * 0.004; // close enough to zoom right up to small details
   camera.far = distance * 50;
   camera.updateProjectionMatrix();
   controls.minDistance = radius * 0.01;
@@ -180,8 +186,6 @@ function frameModel(object) {
   key.shadow.normalBias = radius * 0.004;
 
   rim.position.set(-radius * 2.5, radius * 2, -radius * 3).add(target);
-
-  resetView();
 }
 
 function flyTo(position, target) {
@@ -213,7 +217,6 @@ function stepTween(now) {
   if (k === 1) tween = null;
 }
 
-let modelRoot = null;
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 
@@ -241,55 +244,100 @@ function resetView() {
   dirty = true;
 }
 
-/* ---------- Loading ---------- */
+/* ---------- Loading one model ---------- */
 
 let bust = '';
-let alphaModes = {}; // texture name -> 'cutout' | 'blend' (from viewer.json)
-
-const manager = new THREE.LoadingManager();
-createTextureSupport(manager, { assetsBase: ASSETS, bust: () => bust });
-
-function setProgress(fraction, text) {
-  ui.loader.classList.toggle('is-indeterminate', fraction == null);
-  if (fraction != null) ui.barFill.style.width = `${Math.round(fraction * 100)}%`;
-  if (text) ui.loaderText.textContent = text;
-}
 
 function formatMB(bytes) {
   return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
-async function loadConfig() {
-  try {
-    const res = await fetch(`${ASSETS}viewer.json`, { cache: 'no-cache' });
-    if (!res.ok) throw new Error(res.status);
-    return { ...DEFAULTS, ...(await res.json()) };
-  } catch {
-    return DEFAULTS;
+const joinPath = (folder, name) => (folder ? `${folder}/${name}` : name);
+
+/** Loads an OBJ and the material file (.mtl) it refers to. */
+async function loadObj(manager, entry, url, onBytes, missing) {
+  const text = await new THREE.FileLoader(manager).loadAsync(url, onBytes);
+
+  // An OBJ names its material file on a "mtllib" line; viewer.json can override it with "mtl".
+  const mtlNames = entry.mtl
+    ? [entry.mtl]
+    : [...text.matchAll(/^[ \t]*mtllib[ \t]+(.+?)[ \t]*$/gm)].map((m) => m[1]);
+
+  let materials = null;
+  for (const name of mtlNames) {
+    const path = findAsset(entry.folder, name);
+    if (!path) {
+      missing.add(name.split(/[\\/]/).pop());
+      continue;
+    }
+    materials = await new MTLLoader(manager).loadAsync(assetUrl(ASSETS, path) + bust);
+    materials.preload();
+    break; // three.js uses one material file per OBJ
   }
+
+  const loader = new OBJLoader(manager);
+  if (materials) loader.setMaterials(materials);
+  const object = loader.parse(text);
+
+  object.traverse((child) => {
+    if (!child.isMesh) return;
+    // OBJs without normals would render faceted and black-ish.
+    if (!child.geometry.attributes.normal) child.geometry.computeVertexNormals();
+    for (const m of Array.isArray(child.material) ? child.material : [child.material]) {
+      // Some exporters write a black base colour next to a texture, which would hide the texture.
+      if (m.map && m.color?.getHex() === 0x000000) m.color.set(0xffffff);
+    }
+  });
+  return object;
 }
 
-// The manager is "busy" from the first file request until every file
-// (model + textures, including failed ones) has finished.
-let busy = false;
-const idleWaiters = [];
-manager.onStart = () => (busy = true);
-manager.onLoad = () => {
-  busy = false;
-  idleWaiters.splice(0).forEach((resolve) => resolve());
-};
-manager.onProgress = (_url, loaded, total) => {
-  // `total` includes the FBX itself, which is already done at this stage.
-  if (ui.loader.dataset.phase === 'textures' && total > 1) {
-    setProgress((loaded - 1) / (total - 1), `Loading textures ${loaded - 1} of ${total - 1}`);
-  }
-};
+/**
+ * Loads one model and all its textures, with its own loading manager so two
+ * models can load at the same time without mixing up their files.
+ */
+async function loadModel(entry, report) {
+  const manager = new THREE.LoadingManager();
+  const { missing } = createTextureSupport(manager, { assetsBase: ASSETS, folder: entry.folder, bust });
 
-function waitForTextures() {
-  return busy ? new Promise((resolve) => idleWaiters.push(resolve)) : Promise.resolve();
+  let busy = false;
+  let lastLoaded = 0;
+  let textureBase = null; // files already done when textures started
+  const idleWaiters = [];
+  manager.onStart = () => (busy = true);
+  manager.onLoad = () => {
+    busy = false;
+    idleWaiters.splice(0).forEach((resolve) => resolve());
+  };
+  manager.onProgress = (_url, loaded, total) => {
+    lastLoaded = loaded;
+    if (textureBase != null && total > textureBase) {
+      const done = loaded - textureBase;
+      const all = total - textureBase;
+      report(done / all, `Loading textures ${done} of ${all}`);
+    }
+  };
+
+  const path = findAsset(entry.folder, entry.file) ?? joinPath(entry.folder, entry.file);
+  const url = assetUrl(ASSETS, path) + bust;
+  const onBytes = (e) => {
+    if (e.lengthComputable) report(e.loaded / e.total, `Loading model ${formatMB(e.loaded)} of ${formatMB(e.total)}`);
+    else report(null, `Loading model ${formatMB(e.loaded)}`);
+  };
+
+  const { ext } = splitName(entry.file);
+  let object;
+  if (ext === 'fbx') object = await new FBXLoader(manager).loadAsync(url, onBytes);
+  else if (ext === 'obj') object = await loadObj(manager, entry, url, onBytes, missing);
+  else throw Object.assign(new Error('unsupported'), { unsupported: true });
+
+  textureBase = lastLoaded;
+  report(null, 'Loading textures');
+  if (busy) await new Promise((resolve) => idleWaiters.push(resolve));
+
+  return { object, missing };
 }
 
-function prepareMaterials(object) {
+function prepareMaterials(object, alphaModes) {
   const maxAniso = renderer.capabilities.getMaxAnisotropy();
   object.traverse((child) => {
     if (!child.isMesh) return;
@@ -298,9 +346,9 @@ function prepareMaterials(object) {
     const materials = Array.isArray(child.material) ? child.material : [child.material];
     for (const m of materials) {
       // A texture that couldn't be loaded would draw as solid black; show the plain material colour instead.
-      for (const key of ['map', 'normalMap', 'specularMap', 'emissiveMap', 'bumpMap', 'alphaMap', 'aoMap']) {
-        if (m[key]?.userData.failed) {
-          m[key] = null;
+      for (const slot of ['map', 'normalMap', 'specularMap', 'emissiveMap', 'bumpMap', 'alphaMap', 'aoMap']) {
+        if (m[slot]?.userData.failed) {
+          m[slot] = null;
           m.needsUpdate = true;
         }
       }
@@ -323,84 +371,242 @@ function prepareMaterials(object) {
   });
 }
 
+/* ---------- Models and tabs ---------- */
+
+/** @type {Array<{entry, slug, alpha, playAnimation, status, progress, object, framing, mixer, missing, error, view, noticeDismissed, tab}>} */
+let models = [];
+let current = null;
+let hintShown = false;
+
+const slugify = (text) =>
+  text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '') || 'model';
+
+const normalizeAlpha = (alpha) =>
+  Object.fromEntries(
+    Object.entries(alpha ?? {}).map(([name, mode]) => [String(name).replace(/\.[^.]+$/, '').toLowerCase(), mode]),
+  );
+
+async function loadConfig() {
+  let raw = {};
+  try {
+    const res = await fetch(`${ASSETS}viewer.json`, { cache: 'no-cache' });
+    if (res.ok) raw = await res.json();
+  } catch {
+    /* use defaults */
+  }
+  const config = { ...DEFAULTS, ...raw };
+  // Older single-model format: { "title": ..., "model": "x.fbx" }
+  config.models =
+    Array.isArray(raw.models) && raw.models.length
+      ? raw.models
+      : [{ title: raw.title, description: raw.description, file: raw.model ?? 'model.fbx', alpha: raw.alpha }];
+  return config;
+}
+
+function setProgress(fraction, text) {
+  ui.loader.classList.toggle('is-indeterminate', fraction == null);
+  if (fraction != null) ui.barFill.style.width = `${Math.round(fraction * 100)}%`;
+  if (text) ui.loaderText.textContent = text;
+}
+
+function showLoader(model) {
+  ui.loader.classList.remove('is-done', 'is-error');
+  ui.barFill.style.width = '0';
+  setProgress(model.progress?.fraction ?? null, model.progress?.text ?? 'Loading model');
+}
+
 function showError(message) {
-  ui.loader.classList.remove('is-indeterminate');
+  ui.loader.classList.remove('is-done', 'is-indeterminate');
   ui.loader.classList.add('is-error');
   ui.loaderText.textContent = message;
+}
+
+function folderLabel(entry) {
+  return `public/assets/${entry.folder ? `${entry.folder}/` : ''}`;
+}
+
+async function load(model) {
+  model.status = 'loading';
+  try {
+    const { object, missing } = await loadModel(model.entry, (fraction, text) => {
+      model.progress = { fraction, text };
+      if (current === model) setProgress(fraction, text);
+    });
+    prepareMaterials(object, model.alpha);
+    object.visible = false;
+    scene.add(object);
+    model.framing = placeModel(object);
+    if (object.animations?.length && model.playAnimation) {
+      model.mixer = new THREE.AnimationMixer(object);
+      model.mixer.clipAction(object.animations[0]).play();
+    }
+    model.object = object;
+    model.missing = missing;
+    model.status = 'ready';
+  } catch (err) {
+    console.error(err);
+    model.status = 'error';
+    const { file } = model.entry;
+    model.error = err.unsupported
+      ? `"${file}" isn't a supported format. Use an .fbx or .obj file.`
+      : `Couldn't load "${file}". Check that the file is in ${folderLabel(model.entry)} and that its name in viewer.json matches.`;
+  }
+  if (current === model) show(model);
+}
+
+/** Puts a model on screen, or its loading/error state. */
+function show(model) {
+  // Leave the other models loaded but hidden, so switching back is instant.
+  for (const m of models) if (m !== model && m.object) m.object.visible = false;
+
+  ui.title.textContent = model.entry.title;
+  ui.subtitle.textContent = model.entry.description;
+  ui.subtitle.hidden = !model.entry.description;
+  document.title = model.entry.title || '3D model viewer';
+  ui.notice.hidden = true;
+
+  if (model.status !== 'ready') {
+    modelRoot = null;
+    mixer = null;
+    bounds = null;
+    ui.btnAnim.hidden = true;
+    if (model.status === 'error') showError(model.error);
+    else showLoader(model);
+    return;
+  }
+
+  model.object.visible = true;
+  modelRoot = model.object;
+  mixer = model.mixer;
+  ui.btnAnim.hidden = !mixer;
+  applyFraming(model.framing);
+  if (model.view) {
+    tween = null;
+    camera.position.copy(model.view.position);
+    controls.target.copy(model.view.target);
+    controls.update();
+  } else {
+    resetView();
+  }
+
+  ui.loader.classList.add('is-done');
+  ui.loader.classList.remove('is-error');
+  ui.toolbar.hidden = false;
+
+  if (model.missing.size && !model.noticeDismissed) {
+    const list = [...model.missing].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).join(', ');
+    ui.noticeText.textContent = `Missing files: ${list}. Add files with these names (.tga, .png or .jpg for textures) to ${folderLabel(model.entry)}.`;
+    ui.notice.hidden = false;
+    ui.hint.hidden = true;
+  } else if (!hintShown) {
+    showHint();
+  }
+  dirty = true;
+}
+
+function select(index, { updateUrl = true } = {}) {
+  const model = models[index];
+  if (!model || model === current) return;
+
+  // Remember where the camera was, so coming back to this model keeps the view.
+  if (current?.status === 'ready') {
+    current.view = { position: camera.position.clone(), target: controls.target.clone() };
+  }
+  current = model;
+
+  models.forEach((m, i) => {
+    if (!m.tab) return;
+    const selected = i === index;
+    m.tab.setAttribute('aria-selected', String(selected));
+    m.tab.tabIndex = selected ? 0 : -1;
+  });
+  if (updateUrl && models.length > 1) history.replaceState(null, '', `#${model.slug}`);
+
+  // Models load the first time they're opened, so the page starts fast.
+  if (model.status === 'idle') load(model);
+  show(model);
+}
+
+function buildTabs() {
+  if (models.length < 2) return;
+  document.body.classList.add('has-tabs');
+  ui.tabs.hidden = false;
+  models.forEach((model, i) => {
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', 'false');
+    tab.tabIndex = -1;
+    tab.textContent = model.entry.title;
+    tab.title = model.entry.title;
+    tab.addEventListener('click', () => select(i));
+    ui.tabs.append(tab);
+    model.tab = tab;
+  });
+
+  // Arrow keys move between tabs.
+  ui.tabs.addEventListener('keydown', (e) => {
+    const i = models.indexOf(current);
+    const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[e.key];
+    let next = step ? (i + step + models.length) % models.length : null;
+    if (e.key === 'Home') next = 0;
+    if (e.key === 'End') next = models.length - 1;
+    if (next == null) return;
+    e.preventDefault();
+    select(next);
+    models[next].tab.focus();
+  });
+}
+
+function modelFromUrl() {
+  const slug = decodeURIComponent(location.hash.slice(1));
+  const i = models.findIndex((m) => m.slug === slug);
+  return i === -1 ? 0 : i;
 }
 
 async function start() {
   const config = await loadConfig();
 
-  document.title = config.title || '3D model viewer';
-  ui.title.textContent = config.title;
-  if (config.description) {
-    ui.subtitle.textContent = config.description;
-    ui.subtitle.hidden = false;
-  }
-  if (config.background) {
-    document.body.style.background = config.background;
-  }
-  alphaModes = Object.fromEntries(
-    Object.entries(config.alpha ?? {}).map(([name, mode]) => [String(name).replace(/\.[^.]+$/, '').toLowerCase(), mode]),
-  );
+  if (config.background) document.body.style.background = config.background;
   bust = config.version ? `?v=${encodeURIComponent(config.version)}` : '';
-
-  ui.loader.dataset.phase = 'model';
-  setProgress(null, 'Loading model');
-
-  const loader = new FBXLoader(manager);
-  let object;
-  try {
-    object = await loader.loadAsync(`${ASSETS}${encodeURIComponent(config.model)}${bust}`, (e) => {
-      if (e.lengthComputable) {
-        setProgress(e.loaded / e.total, `Loading model ${formatMB(e.loaded)} of ${formatMB(e.total)}`);
-      } else {
-        setProgress(null, `Loading model ${formatMB(e.loaded)}`);
-      }
-    });
-  } catch (err) {
-    console.error(err);
-    showError(
-      `Couldn't load "${config.model}". Check that the file is in public/assets/ and that its name in viewer.json matches exactly, including upper and lower case.`,
-    );
-    return;
-  }
-
-  ui.loader.dataset.phase = 'textures';
-  setProgress(null, 'Loading textures');
-  await waitForTextures();
-
-  prepareMaterials(object);
-  scene.add(object);
-  modelRoot = object;
-  frameModel(object);
-
-  if (object.animations.length && config.playAnimation) {
-    mixer = new THREE.AnimationMixer(object);
-    mixer.clipAction(object.animations[0]).play();
-    ui.btnAnim.hidden = false;
-  }
-
   controls.autoRotate = config.autoRotate && !reducedMotion;
   ui.btnRotate.setAttribute('aria-pressed', String(controls.autoRotate));
 
-  ui.loader.classList.add('is-done');
-  ui.toolbar.hidden = false;
-  showHint();
+  const used = new Set();
+  models = config.models.map((e, i) => {
+    const title = e.title || `Model ${i + 1}`;
+    let slug = slugify(title);
+    if (used.has(slug)) slug = `${slug}-${i + 1}`;
+    used.add(slug);
+    return {
+      entry: {
+        title,
+        description: e.description || '',
+        file: e.file ?? e.model ?? 'model.fbx',
+        folder: String(e.folder ?? '').replace(/^\/+|\/+$/g, ''),
+        mtl: e.mtl,
+      },
+      slug,
+      alpha: normalizeAlpha(e.alpha),
+      playAnimation: e.playAnimation ?? config.playAnimation,
+      status: 'idle',
+    };
+  });
 
-  if (missing.size) {
-    const list = [...missing].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).join(', ');
-    ui.noticeText.textContent = `Missing textures: ${list}. Add files with these names (.tga, .png or .jpg) to public/assets/.`;
-    ui.notice.hidden = false;
-    ui.hint.hidden = true;
-  }
-  dirty = true;
+  buildTabs();
+  select(modelFromUrl(), { updateUrl: false });
+  window.addEventListener('hashchange', () => select(modelFromUrl(), { updateUrl: false }));
 }
 
 /* ---------- UI ---------- */
 
 function showHint() {
+  hintShown = true;
   ui.hint.textContent = coarsePointer
     ? 'Drag to rotate, pinch to zoom, double-tap to focus'
     : 'Drag to rotate, scroll to zoom, double-click to focus';
@@ -435,7 +641,10 @@ if (document.fullscreenEnabled) {
   });
 }
 
-ui.noticeClose.addEventListener('click', () => (ui.notice.hidden = true));
+ui.noticeClose.addEventListener('click', () => {
+  ui.notice.hidden = true;
+  if (current) current.noticeDismissed = true;
+});
 
 // Double-click or double-tap: focus on that part of the model, or reset the view if you tap the background.
 // (Detected from pointer events because phones don't reliably send "dblclick".)

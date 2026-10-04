@@ -1,13 +1,18 @@
 {
-  "title": "Zidane",
-  "description": "",
-  "model": "Zidane.fbx",
-  "version": "1",
+  "models": [
+    {
+      "title": "Zidane",
+      "file": "Zidane.fbx",
+      "alpha": { "26": "cutout", "14": "blend" }
+    },
+    {
+      "title": "Zidane (better colors)",
+      "folder": "model2",
+      "file": "Zidane.obj"
+    }
+  ],
+  "version": "2",
   "autoRotate": true,
   "playAnimation": true,
-  "background": "",
-  "alpha": {
-    "26": "cutout",
-    "14": "blend"
-  }
+  "background": ""
 }

@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { defineConfig } from 'vite';
 
-// Gives the viewer the list of files in public/assets/ so it can match
-// textures by name whatever their extension is.
+// Gives the viewer the list of files in public/assets/ (and its subfolders) so it
+// can find models and match textures by name whatever their extension is.
 function assetList() {
   const id = 'virtual:asset-list';
   const resolved = `\0${id}`;
@@ -13,7 +13,13 @@ function assetList() {
     resolveId: (source) => (source === id ? resolved : undefined),
     load(source) {
       if (source !== resolved) return undefined;
-      const files = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+      // Relative paths with "/" separators, including files in subfolders (one folder per model).
+      const files = fs.existsSync(dir)
+        ? fs
+            .readdirSync(dir, { recursive: true, withFileTypes: true })
+            .filter((d) => d.isFile() && !d.name.startsWith('.'))
+            .map((d) => path.relative(dir, path.join(d.parentPath ?? d.path, d.name)).split(path.sep).join('/'))
+        : [];
       return `export default ${JSON.stringify(files)};`;
     },
     configureServer(server) {
